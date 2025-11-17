@@ -4,12 +4,13 @@
 -define(PORT, 4000).
 -define(HISTORY_SIZE, 5). 
 
--export([listen_loop/1, accept_loop/2, client_handler/2, server_state_loop/4, handler_loop/3, parse_message/1, show_clients/0, show_history/0]).
-
+% Export dynamically spawned functions for compiler visibility
+-export([listen_loop/1, accept_loop/2, client_handler/2, server_state_loop/5, handler_loop/3, parse_message/1, show_clients/0, show_history/0]).
 
 start(MaxClients) ->
     io:format("[SERVER] Starting main server state process...~n"),
-    ServerPid = spawn(fun() -> server_state_loop(MaxClients, 0, #{}, []) end),
+    % start server state with initial topic
+    ServerPid = spawn(fun() -> server_state_loop(MaxClients, 0, #{}, [], "No topic set") end),
     register(chat_server_registry, ServerPid), 
     io:format("[SERVER] Starting acceptor process, linking to state manager ~p...~n", [ServerPid]),
     spawn(fun() -> listen_loop(ServerPid) end),
@@ -26,8 +27,8 @@ broadcast_message(ClientsMap, _Sender, Msg, _History) ->
         ClientsMap
     ).
 
-% The core state management loop
-server_state_loop(MaxClients, CurrentCount, ClientsMap, History) ->
+% The core state management loop (now includes Topic)
+server_state_loop(MaxClients, CurrentCount, ClientsMap, History, Topic) ->
     receive
         {io_reply, FromPid, Result} ->
             case Result of
@@ -48,7 +49,7 @@ server_state_loop(MaxClients, CurrentCount, ClientsMap, History) ->
                 _ -> io:format("Unknown server command.~n")
             end,
             spawn(fun() -> io:read(FromPid, "") end),
-            server_state_loop(MaxClients, CurrentCount, ClientsMap, History);
+            server_state_loop(MaxClients, CurrentCount, ClientsMap, History, Topic);
 
         % Client registration request with a username
         {register_request, FromPid, Socket, Username} ->
@@ -56,10 +57,13 @@ server_state_loop(MaxClients, CurrentCount, ClientsMap, History) ->
             case maps:is_key(Username, ClientsMap) of
                 true ->
                     FromPid ! {register_response, {username_taken, Username}},
-                    server_state_loop(MaxClients, CurrentCount, ClientsMap, History);
+                    server_state_loop(MaxClients, CurrentCount, ClientsMap, History, Topic);
                 false when CurrentCount < MaxClients ->
                     NewMap = maps:put(Username, {FromPid, Socket}, ClientsMap),
                     NewCount = CurrentCount + 1,
+
+                    % Send current topic to the new client
+                    gen_tcp:send(Socket, io_lib:format("[System] Current Topic: ~s~n", [Topic])),
 
                     % Send history to the new client
                     lists:foreach(
@@ -71,10 +75,10 @@ server_state_loop(MaxClients, CurrentCount, ClientsMap, History) ->
                     EntryMsg = io_lib:format("[System] ~s has joined the chat.~n", [Username]),
                     broadcast_message(NewMap, system, EntryMsg, History),
 
-                    server_state_loop(MaxClients, NewCount, NewMap, History);
+                    server_state_loop(MaxClients, NewCount, NewMap, History, Topic);
                 false -> % Server full
                     FromPid ! {register_response, full},
-                    server_state_loop(MaxClients, CurrentCount, ClientsMap, History)
+                    server_state_loop(MaxClients, CurrentCount, ClientsMap, History, Topic)
             end;
 
         % Client broadcast message
@@ -87,7 +91,7 @@ server_state_loop(MaxClients, CurrentCount, ClientsMap, History) ->
             
             broadcast_message(ClientsMap, broadcast, FormattedMsg, NewHistory),
 
-            server_state_loop(MaxClients, CurrentCount, ClientsMap, NewHistory); 
+            server_state_loop(MaxClients, CurrentCount, ClientsMap, NewHistory, Topic); 
         
         {private_message, SenderUsername, ReceiverUsername, Message} ->
             FormattedMsg = io_lib:format("[Private from ~s] ~s", [SenderUsername, Message]),
@@ -106,13 +110,25 @@ server_state_loop(MaxClients, CurrentCount, ClientsMap, History) ->
                             ok
                     end
             end,
-            server_state_loop(MaxClients, CurrentCount, ClientsMap, History);
+            server_state_loop(MaxClients, CurrentCount, ClientsMap, History, Topic);
             
         % Client requests user list
         {get_users, FromPid, _SenderUsername} -> 
             Usernames = maps:keys(ClientsMap),
             FromPid ! {users_list, Usernames},
-            server_state_loop(MaxClients, CurrentCount, ClientsMap, History);
+            server_state_loop(MaxClients, CurrentCount, ClientsMap, History, Topic);
+
+        % Client requests the current topic
+        {get_topic, FromPid} ->
+            FromPid ! {topic_response, Topic},
+            server_state_loop(MaxClients, CurrentCount, ClientsMap, History, Topic);
+
+        % Client sets a new topic
+        {set_topic, Username, NewTopic} ->
+            NewTopicStr = lists:flatten(NewTopic),
+            BroadcastMsg = io_lib:format("[System] Topic changed by ~s: ~s~n", [Username, NewTopicStr]),
+            broadcast_message(ClientsMap, system, BroadcastMsg, History),
+            server_state_loop(MaxClients, CurrentCount, ClientsMap, History, NewTopicStr);
 
         % Client disconnects
         {unregister_request, Username} ->
@@ -121,16 +137,16 @@ server_state_loop(MaxClients, CurrentCount, ClientsMap, History) ->
                     NewCount = CurrentCount - 1,
                     ExitMsg = io_lib:format("[System] ~s has left the chat.~n", [Username]),
                     broadcast_message(RemainingMap, system, ExitMsg, History),
-                    server_state_loop(MaxClients, NewCount, RemainingMap, History);
+                    server_state_loop(MaxClients, NewCount, RemainingMap, History, Topic);
                 error ->
-                    server_state_loop(MaxClients, CurrentCount, ClientsMap, History)
+                    server_state_loop(MaxClients, CurrentCount, ClientsMap, History, Topic)
             end;
 
         _Other ->
-            server_state_loop(MaxClients, CurrentCount, ClientsMap, History)
+            server_state_loop(MaxClients, CurrentCount, ClientsMap, History, Topic)
     after 1000 ->
         spawn(fun() -> io:read(self(), "") end),
-        server_state_loop(MaxClients, CurrentCount, ClientsMap, History)
+        server_state_loop(MaxClients, CurrentCount, ClientsMap, History, Topic)
     end.
 
 
@@ -191,8 +207,19 @@ handler_loop(Socket, ServerPid, Username) ->
                             gen_tcp:send(Socket, io_lib:format("[System] Connected users: ~p~n", [Users]))
                     end,
                     handler_loop(Socket, ServerPid, Username);
+                {get_topic} ->
+                    ServerPid ! {get_topic, self()},
+                    receive
+                        {topic_response, Topic} ->
+                            gen_tcp:send(Socket, io_lib:format("[System] Current Topic: ~s~n", [Topic]))
+                    end,
+                    handler_loop(Socket, ServerPid, Username);
+                {set_topic, TopicBin} ->
+                    % TopicBin is a binary; convert to list for server storage & broadcast
+                    ServerPid ! {set_topic, Username, binary_to_list(TopicBin)},
+                    handler_loop(Socket, ServerPid, Username);
                 _ ->
-                    gen_tcp:send(Socket, "[System] Invalid command. Use: /msg <user> <message>, /users, or a normal message.\n"),
+                    gen_tcp:send(Socket, "[System] Invalid command. Use: /msg <user> <message>, /users, /topic, or a normal message.\n"),
                     handler_loop(Socket, ServerPid, Username)
             end;
         {error, closed} ->
@@ -209,7 +236,15 @@ parse_message(Msg) ->
     case Tokens of
         ["/msg", ToUser | Text] when length(Text) > 0 -> 
             {private, ToUser, list_to_binary(string:join(Text, " "))};
+
         ["/users"] -> {get_users};
+
+        ["/topic"] -> {get_topic};
+
+        ["/topic" | TopicWords] ->
+            NewTopic = string:join(TopicWords, " "),
+            {set_topic, list_to_binary(NewTopic)};
+
         _ -> {broadcast, list_to_binary(Msg)}
     end.
 

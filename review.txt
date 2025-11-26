@@ -1,0 +1,4 @@
+1. timestamp add
+2. check processes during stop
+3. add crash handling
+4. / <command> even for normal msg + error handling(not valid command)
